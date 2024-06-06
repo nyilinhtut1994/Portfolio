@@ -1,0 +1,85 @@
+name: deploy nodejs on ec2
+
+env:
+  SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+  REGION: ${{ secrets.REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_TOKEN_STDOUT: ${{ secrets.ECR_TOKEN_STDOUT }}
+
+  SSH_USER: ${{ vars.SSH_USER }}
+  CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
+  IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+  DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+  TARGET_HOST: ${{ vars.TARGET_HOST}}
+
+on:
+  push:
+    branches:
+        - master
+
+jobs:
+  build-dockerfile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.1.6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.REGION}}
+
+
+      - name: login to the ECR 
+        run: |
+          aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
+    
+      - name: build the docker image
+        run: docker build -t $CONTAINER_NAME/$IMAGE_NAME:latest .
+
+      - name: push the image to ECR
+        run: docker push $CONTAINER_NAME/$IMAGE_NAME:latest
+    
+  deploy-dockerfile:
+    needs: build-dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.1.6
+    
+      - name: Create SSH key
+        run: |
+          echo "$SSH_PRIVATE_KEY" > private.key
+          sudo chmod 400 private.key
+          eval $(ssh-agent -s)
+          ssh-add private.key
+          mkdir -p ~/.ssh
+          touch ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          ssh-keyscan -H $TARGET_HOST >> ~/.ssh/known_hosts 
+        
+      - name: set up ansible
+        run: |
+          sudo apt-get update -y
+          sudo apt-get upgrade -y
+          sudo apt install software-properties-common
+          sudo add-apt-repository --yes --update ppa:ansible/ansible
+          sudo apt install ansible
+
+      - name: Create inventory file
+        run: |
+          echo "server ansible_host=$TARGET_HOST ansible_user=$SSH_USER ansible_ssh_private_key_file=private.key" > inventory
+
+      - name: Deploy with Ansible
+        run: |
+          ansible-playbook -i inventory \
+          --extra-vars "image_name=$IMAGE_NAME" \
+          --extra-vars "domain_name=$DOMAIN_NAME" \
+          --extra-vars "container_name=$CONTAINER_NAME" \
+          --extra-vars "aws_account_id=$AWS_ACCOUNT_ID" \
+          --extra-vars "region=$REGION" \
+          --extra-vars "ecr_token_stdout=$ECR_TOKEN_STDOUT" \
+          --extra-vars "ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+          devops/playbook.yml
